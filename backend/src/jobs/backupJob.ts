@@ -641,7 +641,7 @@ export class BackupJob {
     try {
       const command = `sha256sum ${filePath}`;
       const { stdout } = await execAsync(command);
-      return stdout.split(' ')[0];
+      return (stdout || '').split(' ')[0];
     } catch (error) {
       logger.error('Checksum calculation failed:', error);
       return '';
