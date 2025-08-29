@@ -1,0 +1,79 @@
+{
+  "name": "pharmacy-system-backend",
+  "version": "1.0.0",
+  "description": "Backend API for Pharmacy Management System",
+  "main": "dist/server.js",
+  "scripts": {
+    "start": "node dist/server.js",
+    "dev": "nodemon src/server.ts",
+    "build": "tsc",
+    "test": "jest",
+    "test:watch": "jest --watch",
+    "lint": "eslint src/**/*.ts",
+    "lint:fix": "eslint src/**/*.ts --fix",
+    "db:generate": "prisma generate",
+    "db:push": "prisma db push",
+    "db:migrate": "prisma migrate dev",
+    "db:migrate:deploy": "prisma migrate deploy",
+    "db:migrate:reset": "prisma migrate reset",
+    "db:migrate:status": "prisma migrate status",
+    "db:seed": "ts-node src/database/seeders/index.ts",
+    "db:studio": "prisma studio",
+    "db:backup": "ts-node src/database/backup.ts",
+    "db:optimize": "ts-node src/database/optimize.ts"
+  },
+  "keywords": [
+    "pharmacy",
+    "healthcare",
+    "typescript",
+    "express",
+    "nodejs"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "helmet": "^7.1.0",
+    "morgan": "^1.10.0",
+    "dotenv": "^16.3.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "express-validator": "^7.0.1",
+    "multer": "^1.4.5-lts.1",
+    "winston": "^3.11.0",
+    "node-cron": "^3.0.3",
+    "prisma": "^5.7.0",
+    "@prisma/client": "^5.7.0",
+    "redis": "^4.6.10",
+    "nodemailer": "^6.9.7",
+    "joi": "^17.11.0",
+    "canvas": "^2.11.0"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.0",
+    "@types/express": "^4.17.21",
+    "@types/cors": "^2.8.17",
+    "@types/morgan": "^1.9.9",
+    "@types/bcryptjs": "^2.4.6",
+    "@types/jsonwebtoken": "^9.0.5",
+    "@types/multer": "^1.4.11",
+    "@types/nodemailer": "^6.4.14",
+    "@types/pg": "^8.10.9",
+    "@types/jest": "^29.5.8",
+    "@typescript-eslint/eslint-plugin": "^6.13.0",
+    "@typescript-eslint/parser": "^6.13.0",
+    "eslint": "^8.54.0",
+    "jest": "^29.7.0",
+    "nodemon": "^3.0.2",
+    "ts-jest": "^29.1.1",
+    "ts-node": "^10.9.1",
+    "typescript": "^5.3.2"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "prisma": {
+    "seed": "ts-node src/database/seeders/index.ts"
+  }
+}

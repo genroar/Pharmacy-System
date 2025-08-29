@@ -1,0 +1,346 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql" // Can be changed to "mysql" or "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// User Management
+model User {
+  id            String   @id @default(cuid())
+  firstName     String   @map("first_name")
+  lastName      String   @map("last_name")
+  email         String   @unique
+  password      String
+  phone         String
+  role          UserRole @default(CUSTOMER)
+  isActive      Boolean  @default(true) @map("is_active")
+  emailVerified Boolean  @default(false) @map("email_verified")
+  phoneVerified Boolean  @default(false) @map("phone_verified")
+  lastLogin     DateTime? @map("last_login")
+  profileImage  String?  @map("profile_image")
+  
+  // Address
+  street        String?
+  city          String?
+  state         String?
+  zipCode       String?  @map("zip_code")
+  country       String?
+  
+  // Preferences
+  notifications Boolean  @default(true)
+  language      String   @default("en")
+  timezone      String   @default("UTC")
+  
+  // Timestamps
+  createdAt     DateTime @default(now()) @map("created_at")
+  updatedAt     DateTime @updatedAt @map("updated_at")
+  
+  // Relations
+  prescriptions Prescription[]
+  orders       Order[]
+  reviews      Review[]
+  
+  @@map("users")
+}
+
+enum UserRole {
+  ADMIN
+  PHARMACIST
+  STAFF
+  CUSTOMER
+}
+
+// Medicine Management
+model Medicine {
+  id                   String   @id @default(cuid())
+  name                 String
+  genericName          String   @map("generic_name")
+  brandName            String   @map("brand_name")
+  description          String
+  activeIngredients    String[] @map("active_ingredients")
+  dosageForm          DosageForm
+  strength            String
+  unit                String
+  manufacturer        String
+  prescriptionRequired Boolean  @default(false) @map("prescription_required")
+  controlledSubstance Boolean  @default(false) @map("controlled_substance")
+  schedule            Schedule  @default(OTC)
+  
+  // Medical Information
+  sideEffects         String[]
+  contraindications   String[]
+  interactions        String[]
+  storageConditions   String @map("storage_conditions")
+  
+  // Inventory
+  expiryDate          DateTime @map("expiry_date")
+  batchNumber         String  @unique @map("batch_number")
+  sku                 String  @unique
+  barcode             String? @unique
+  requiresRefrigeration Boolean @default(false) @map("requires_refrigeration")
+  
+  // Pricing
+  price               Decimal @db.Decimal(10, 2)
+  cost                Decimal @db.Decimal(10, 2)
+  taxRate             Decimal @default(0) @db.Decimal(5, 2) @map("tax_rate")
+  discountPercentage  Decimal @default(0) @db.Decimal(5, 2) @map("discount_percentage")
+  
+  // Status
+  isActive            Boolean @default(true) @map("is_active")
+  imageUrl            String? @map("image_url")
+  tags                String[]
+  
+  // Timestamps
+  createdAt           DateTime @default(now()) @map("created_at")
+  updatedAt           DateTime @updatedAt @map("updated_at")
+  
+  // Relations
+  categoryId          String
+  category            Category @relation(fields: [categoryId], references: [id])
+  supplierId          String
+  supplier            Supplier @relation(fields: [supplierId], references: [id])
+  inventoryItems      InventoryItem[]
+  prescriptionItems   PrescriptionItem[]
+  orderItems          OrderItem[]
+  reviews             Review[]
+  
+  @@map("medicines")
+}
+
+enum DosageForm {
+  TABLET
+  CAPSULE
+  LIQUID
+  INJECTION
+  CREAM
+  OINTMENT
+  DROPS
+  INHALER
+  SUPPOSITORY
+}
+
+enum Schedule {
+  OTC
+  SCHEDULE_I
+  SCHEDULE_II
+  SCHEDULE_III
+  SCHEDULE_IV
+  SCHEDULE_V
+}
+
+// Category Management
+model Category {
+  id          String    @id @default(cuid())
+  name        String    @unique
+  description String?
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  medicines   Medicine[]
+  
+  @@map("categories")
+}
+
+// Supplier Management
+model Supplier {
+  id          String    @id @default(cuid())
+  name        String
+  email       String    @unique
+  phone       String
+  address     String
+  city        String
+  state       String
+  zipCode     String    @map("zip_code")
+  country     String
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  medicines   Medicine[]
+  
+  @@map("suppliers")
+}
+
+// Inventory Management
+model InventoryItem {
+  id          String    @id @default(cuid())
+  quantity    Int
+  minQuantity Int       @default(10) @map("min_quantity")
+  maxQuantity Int       @default(1000) @map("max_quantity")
+  location    String?
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  medicineId  String
+  medicine    Medicine @relation(fields: [medicineId], references: [id])
+  
+  @@map("inventory_items")
+}
+
+// Prescription Management
+model Prescription {
+  id              String    @id @default(cuid())
+  prescriptionNumber String  @unique @map("prescription_number")
+  patientId       String
+  patient         User      @relation(fields: [patientId], references: [id])
+  prescribedBy    String
+  prescribedDate  DateTime  @default(now()) @map("prescribed_date")
+  expiryDate      DateTime  @map("expiry_date")
+  status          PrescriptionStatus @default(PENDING)
+  notes           String?
+  isActive        Boolean   @default(true) @map("is_active")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  items           PrescriptionItem[]
+  
+  @@map("prescriptions")
+}
+
+enum PrescriptionStatus {
+  PENDING
+  APPROVED
+  REJECTED
+  DISPENSED
+  EXPIRED
+  CANCELLED
+}
+
+model PrescriptionItem {
+  id              String    @id @default(cuid())
+  dosage          String
+  frequency       String
+  duration        String
+  instructions    String?
+  quantity        Int
+  isActive        Boolean   @default(true) @map("is_active")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  prescriptionId  String
+  prescription    Prescription @relation(fields: [prescriptionId], references: [id])
+  medicineId      String
+  medicine        Medicine @relation(fields: [medicineId], references: [id])
+  
+  @@map("prescription_items")
+}
+
+// Order Management
+model Order {
+  id              String    @id @default(cuid())
+  orderNumber     String    @unique @map("order_number")
+  customerId      String
+  customer        User      @relation(fields: [customerId], references: [id])
+  totalAmount     Decimal   @db.Decimal(10, 2) @map("total_amount")
+  taxAmount       Decimal   @db.Decimal(10, 2) @map("tax_amount")
+  discountAmount  Decimal   @db.Decimal(10, 2) @map("discount_amount")
+  finalAmount     Decimal   @db.Decimal(10, 2) @map("final_amount")
+  status          OrderStatus @default(PENDING)
+  paymentMethod   PaymentMethod
+  paymentStatus   PaymentStatus @default(PENDING)
+  shippingAddress String
+  shippingCity    String
+  shippingState   String
+  shippingZipCode String    @map("shipping_zip_code")
+  shippingCountry String
+  notes           String?
+  isActive        Boolean   @default(true) @map("is_active")
+  createdAt       DateTime  @default(now()) @map("created_at")
+  updatedAt       DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  items           OrderItem[]
+  
+  @@map("orders")
+}
+
+enum OrderStatus {
+  PENDING
+  CONFIRMED
+  PROCESSING
+  SHIPPED
+  DELIVERED
+  CANCELLED
+  REFUNDED
+}
+
+enum PaymentMethod {
+  CREDIT_CARD
+  DEBIT_CARD
+  BANK_TRANSFER
+  CASH
+  DIGITAL_WALLET
+}
+
+enum PaymentStatus {
+  PENDING
+  PROCESSING
+  COMPLETED
+  FAILED
+  REFUNDED
+}
+
+model OrderItem {
+  id          String    @id @default(cuid())
+  quantity    Int
+  unitPrice   Decimal   @db.Decimal(10, 2) @map("unit_price")
+  totalPrice  Decimal   @db.Decimal(10, 2) @map("total_price")
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  orderId     String
+  order       Order @relation(fields: [orderId], references: [id])
+  medicineId  String
+  medicine    Medicine @relation(fields: [medicineId], references: [id])
+  
+  @@map("order_items")
+}
+
+// Review System
+model Review {
+  id          String    @id @default(cuid())
+  rating      Int       @db.Int
+  comment     String?
+  isActive    Boolean   @default(true) @map("is_active")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+  
+  // Relations
+  userId      String
+  user        User @relation(fields: [userId], references: [id])
+  medicineId  String
+  medicine    Medicine @relation(fields: [medicineId], references: [id])
+  
+  @@map("reviews")
+}
+
+// Audit Log
+model AuditLog {
+  id          String    @id @default(cuid())
+  action      String
+  entityType  String    @map("entity_type")
+  entityId    String    @map("entity_id")
+  userId      String?   @map("user_id")
+  oldValues   Json?     @map("old_values")
+  newValues   Json?     @map("new_values")
+  ipAddress   String?   @map("ip_address")
+  userAgent   String?   @map("user_agent")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  
+  @@map("audit_logs")
+}
