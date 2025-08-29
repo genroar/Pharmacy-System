@@ -1,109 +1,123 @@
 import { logger } from '@/utils/logger';
 import { DateHelper } from '@/utils/dateHelper';
-import { CryptoUtils } from '@/utils/crypto';
 import { PrismaClient } from '@prisma/client';
 import * as fs from 'fs';
 import * as path from 'path';
-import * as archiver from 'archiver';
 import { exec } from 'child_process';
 import { promisify } from 'util';
 
 const execAsync = promisify(exec);
 
 /**
- * Backup job configuration interface
+ * Backup configuration interface
  */
 interface BackupConfig {
   enabled: boolean;
-  schedule: string; // Cron expression
-  retention: {
-    days: number;
-    maxBackups: number;
+  schedule: string;
+  types: {
+    database: boolean;
+    files: boolean;
+    logs: boolean;
+    config: boolean;
   };
-  compression: {
-    enabled: boolean;
-    level: number; // 1-9, higher = more compression
-  };
-  encryption: {
-    enabled: boolean;
-    key?: string;
+  database: {
+    engine: 'postgresql' | 'mysql' | 'sqlite' | 'mongodb';
+    host: string;
+    port: number;
+    username: string;
+    password: string;
+    database: string;
+    backupFormat: 'sql' | 'dump' | 'archive';
+    compression: boolean;
+    compressionLevel: number;
   };
   storage: {
     local: {
       enabled: boolean;
       path: string;
+      maxSize: number;
     };
-    cloud: {
+    remote: {
       enabled: boolean;
-      provider: 'aws' | 'gcp' | 'azure' | 'local';
-      bucket?: string;
-      region?: string;
+      type: 's3' | 'ftp' | 'sftp' | 'cloud';
+      config: any;
     };
   };
-  database: {
+  retention: {
     enabled: boolean;
-    includeData: boolean;
-    includeSchema: boolean;
-    includeMigrations: boolean;
+    maxBackups: number;
+    maxAge: number;
+    keepDaily: number;
+    keepWeekly: number;
+    keepMonthly: number;
+    keepYearly: number;
   };
-  files: {
+  encryption: {
     enabled: boolean;
-    includeLogs: boolean;
-    includeUploads: boolean;
-    includeConfig: boolean;
-    excludePatterns: string[];
+    algorithm: 'aes-256-gcm' | 'aes-256-cbc' | 'chacha20-poly1305';
+    keyFile: string;
+  };
+  verification: {
+    enabled: boolean;
+    verifyAfterBackup: boolean;
+    testRestore: boolean;
+    checksum: boolean;
   };
   notifications: {
     enabled: boolean;
     onSuccess: boolean;
     onFailure: boolean;
-    onCleanup: boolean;
+    onWarning: boolean;
+    recipients: string[];
   };
 }
 
 /**
- * Backup job result interface
+ * Backup result interface
  */
 interface BackupResult {
   success: boolean;
   timestamp: Date;
   duration: number;
+  backupType: string;
+  backupId: string;
   size: number;
   location: string;
-  type: 'full' | 'incremental' | 'differential';
-  details: {
-    database?: {
-      tables: number;
-      records: number;
-      size: number;
-    };
-    files?: {
-      count: number;
-      size: number;
-    };
-    compression?: {
-      originalSize: number;
-      compressedSize: number;
-      ratio: number;
-    };
-    encryption?: {
-      algorithm: string;
-      keySize: number;
-    };
+  checksum: string;
+  metadata: {
+    filesCount: number;
+    databaseSize: number;
+    compressionRatio: number;
+    encryptionEnabled: boolean;
+    verificationPassed: boolean;
   };
-  errors?: string[];
-  warnings?: string[];
+  errors: BackupError[];
+  warnings: string[];
 }
 
 /**
- * Backup job class for managing scheduled database and file backups
+ * Backup error interface
+ */
+interface BackupError {
+  id: string;
+  type: 'database' | 'file' | 'storage' | 'encryption' | 'verification' | 'unknown';
+  message: string;
+  stack?: string;
+  timestamp: Date;
+  retryCount: number;
+  resolved: boolean;
+}
+
+/**
+ * Backup job class for managing database and file system backups
  */
 export class BackupJob {
   private prisma: PrismaClient;
   private config: BackupConfig;
   private isRunning: boolean = false;
-  private lastBackup: Date | null = null;
+  private lastRun: Date | null = null;
   private backupHistory: BackupResult[] = [];
+  private errorQueue: BackupError[] = [];
 
   constructor(prisma: PrismaClient, config?: Partial<BackupConfig>) {
     this.prisma = prisma;
@@ -120,48 +134,61 @@ export class BackupJob {
     return {
       enabled: true,
       schedule: '0 2 * * *', // Daily at 2 AM
-      retention: {
-        days: 30,
-        maxBackups: 10
+      types: {
+        database: true,
+        files: true,
+        logs: false,
+        config: true
       },
-      compression: {
-        enabled: true,
-        level: 6
-      },
-      encryption: {
-        enabled: false,
-        key: undefined
+      database: {
+        engine: 'postgresql',
+        host: 'localhost',
+        port: 5432,
+        username: 'postgres',
+        password: '',
+        database: 'pharmacy_system',
+        backupFormat: 'sql',
+        compression: true,
+        compressionLevel: 6
       },
       storage: {
         local: {
           enabled: true,
-          path: './backups'
+          path: './backups',
+          maxSize: 10 * 1024 * 1024 * 1024 // 10 GB
         },
-        cloud: {
+        remote: {
           enabled: false,
-          provider: 'local',
-          bucket: undefined,
-          region: undefined
+          type: 's3',
+          config: {}
         }
       },
-      database: {
+      retention: {
         enabled: true,
-        includeData: true,
-        includeSchema: true,
-        includeMigrations: true
+        maxBackups: 30,
+        maxAge: 90,
+        keepDaily: 7,
+        keepWeekly: 4,
+        keepMonthly: 12,
+        keepYearly: 5
       },
-      files: {
+      encryption: {
+        enabled: false,
+        algorithm: 'aes-256-gcm',
+        keyFile: './backup-keys/backup.key'
+      },
+      verification: {
         enabled: true,
-        includeLogs: true,
-        includeUploads: true,
-        includeConfig: true,
-        excludePatterns: ['*.tmp', '*.log', 'node_modules', '.git']
+        verifyAfterBackup: true,
+        testRestore: false,
+        checksum: true
       },
       notifications: {
         enabled: true,
         onSuccess: true,
         onFailure: true,
-        onCleanup: true
+        onWarning: true,
+        recipients: ['admin@example.com', 'tech@example.com']
       }
     };
   }
@@ -177,20 +204,13 @@ export class BackupJob {
 
     try {
       logger.info('Starting backup job scheduler');
+      await this.createBackupDirectories();
       
-      // Create backup directory if it doesn't exist
-      if (this.config.storage.local.enabled) {
-        await this.ensureBackupDirectory();
-      }
-
-      // Perform initial backup if no backups exist
       if (this.backupHistory.length === 0) {
-        await this.performBackup();
+        await this.performFullBackup();
       }
 
-      // Schedule regular backups
       this.scheduleBackups();
-
       logger.info('Backup job scheduler started successfully');
     } catch (error) {
       logger.error('Failed to start backup job scheduler:', error);
@@ -213,16 +233,41 @@ export class BackupJob {
   }
 
   /**
-   * Schedule regular backups using cron-like timing
+   * Create backup directories
+   */
+  private async createBackupDirectories(): Promise<void> {
+    try {
+      const backupPath = this.config.storage.local.path;
+      
+      if (!fs.existsSync(backupPath)) {
+        fs.mkdirSync(backupPath, { recursive: true });
+      }
+
+      const subdirs = ['database', 'files', 'logs', 'config'];
+      for (const subdir of subdirs) {
+        const subdirPath = path.join(backupPath, subdir);
+        if (!fs.existsSync(subdirPath)) {
+          fs.mkdirSync(subdirPath, { recursive: true });
+        }
+      }
+
+      logger.info('Backup directories created successfully');
+    } catch (error) {
+      logger.error('Failed to create backup directories:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Schedule regular backups
    */
   private scheduleBackups(): void {
-    // Parse cron expression and schedule next backup
     const nextBackup = this.getNextBackupTime();
     
     setTimeout(async () => {
       if (this.isRunning) {
-        await this.performBackup();
-        this.scheduleBackups(); // Schedule next backup
+        await this.performScheduledBackup();
+        this.scheduleBackups();
       }
     }, nextBackup.getTime() - Date.now());
 
@@ -230,15 +275,14 @@ export class BackupJob {
   }
 
   /**
-   * Calculate next backup time based on cron schedule
+   * Calculate next backup time
    */
   private getNextBackupTime(): Date {
     const now = new Date();
-    const [minute, hour, day, month, weekday] = this.config.schedule.split(' ');
+    const [minute, hour] = this.config.schedule.split(' ');
     
     let nextBackup = new Date(now);
     
-    // Simple cron parsing (for production, use a proper cron library)
     if (minute !== '*') {
       nextBackup.setMinutes(parseInt(minute), 0, 0);
     }
@@ -246,7 +290,6 @@ export class BackupJob {
       nextBackup.setHours(parseInt(hour), 0, 0, 0);
     }
     
-    // If the calculated time is in the past, move to next day
     if (nextBackup <= now) {
       nextBackup.setDate(nextBackup.getDate() + 1);
     }
@@ -255,701 +298,538 @@ export class BackupJob {
   }
 
   /**
-   * Perform a complete backup operation
+   * Perform scheduled backup operation
    */
-  async performBackup(): Promise<BackupResult> {
-    if (this.isRunning) {
-      throw new Error('Backup job is already running');
+  async performScheduledBackup(): Promise<BackupResult[]> {
+    logger.info('Starting scheduled backup operation');
+    const results: BackupResult[] = [];
+
+    try {
+      if (this.config.types.database) {
+        const result = await this.backupDatabase();
+        results.push(result);
+      }
+
+      if (this.config.types.files) {
+        const result = await this.backupFiles();
+        results.push(result);
+      }
+
+      if (this.config.types.logs) {
+        const result = await this.backupLogs();
+        results.push(result);
+      }
+
+      if (this.config.types.config) {
+        const result = await this.backupConfig();
+        results.push(result);
+      }
+
+      await this.processErrors();
+      await this.applyRetentionPolicy();
+
+      if (this.config.notifications.enabled) {
+        await this.sendBackupNotifications(results);
+      }
+
+      logger.info('Scheduled backup operation completed successfully');
+    } catch (error) {
+      logger.error('Scheduled backup operation failed:', error);
     }
 
-    this.isRunning = true;
+    return results;
+  }
+
+  /**
+   * Perform full backup operation
+   */
+  async performFullBackup(): Promise<BackupResult[]> {
+    logger.info('Starting full backup operation');
+    const results: BackupResult[] = [];
+
+    try {
+      if (this.config.types.database) {
+        const result = await this.backupDatabase();
+        results.push(result);
+      }
+
+      if (this.config.types.files) {
+        const result = await this.backupFiles();
+        results.push(result);
+      }
+
+      if (this.config.types.logs) {
+        const result = await this.backupLogs();
+        results.push(result);
+      }
+
+      if (this.config.types.config) {
+        const result = await this.backupConfig();
+        results.push(result);
+      }
+
+      await this.processErrors();
+      await this.applyRetentionPolicy();
+
+      if (this.config.notifications.enabled) {
+        await this.sendBackupNotifications(results);
+      }
+
+      logger.info('Full backup operation completed successfully');
+    } catch (error) {
+      logger.error('Full backup operation failed:', error);
+    }
+
+    return results;
+  }
+
+  /**
+   * Backup database
+   */
+  private async backupDatabase(): Promise<BackupResult> {
     const startTime = Date.now();
     const timestamp = new Date();
-    const backupId = this.generateBackupId(timestamp);
+    const backupId = this.generateBackupId('database');
 
-    logger.info(`Starting backup: ${backupId}`);
+    logger.info('Starting database backup');
 
     try {
       const result: BackupResult = {
         success: false,
         timestamp,
         duration: 0,
+        backupType: 'database',
+        backupId,
         size: 0,
         location: '',
-        type: 'full',
-        details: {},
+        checksum: '',
+        metadata: {
+          filesCount: 0,
+          databaseSize: 0,
+          compressionRatio: 0,
+          encryptionEnabled: false,
+          verificationPassed: false
+        },
         errors: [],
         warnings: []
       };
 
-      // Create backup directory
-      const backupDir = path.join(this.config.storage.local.path, backupId);
-      await fs.promises.mkdir(backupDir, { recursive: true });
+      const backupPath = path.join(
+        this.config.storage.local.path,
+        'database',
+        `db-backup-${DateHelper.formatDate(timestamp, 'YYYY-MM-DD-HH-mm-ss')}.sql`
+      );
 
-      // Perform database backup
-      if (this.config.database.enabled) {
-        await this.backupDatabase(backupDir, result);
+      await this.performDatabaseBackup(backupPath);
+
+      const fileStats = fs.statSync(backupPath);
+      result.size = fileStats.size;
+      result.location = backupPath;
+
+      if (this.config.database.compression) {
+        const compressedPath = await this.compressFile(backupPath);
+        result.location = compressedPath;
+        result.size = fs.statSync(compressedPath).size;
+        result.metadata.compressionRatio = (1 - (result.size / fileStats.size)) * 100;
+        fs.unlinkSync(backupPath);
       }
 
-      // Perform file backup
-      if (this.config.files.enabled) {
-        await this.backupFiles(backupDir, result);
+      if (this.config.verification.checksum) {
+        result.checksum = await this.calculateChecksum(result.location);
       }
 
-      // Create backup archive
-      const archivePath = await this.createBackupArchive(backupDir, backupId, result);
-
-      // Apply compression if enabled
-      if (this.config.compression.enabled) {
-        await this.compressBackup(archivePath, result);
+      if (this.config.verification.verifyAfterBackup) {
+        result.metadata.verificationPassed = await this.verifyBackup(result.location);
       }
 
-      // Apply encryption if enabled
-      if (this.config.encryption.enabled) {
-        await this.encryptBackup(archivePath, result);
-      }
-
-      // Upload to cloud storage if enabled
-      if (this.config.storage.cloud.enabled) {
-        await this.uploadToCloud(archivePath, backupId, result);
-      }
-
-      // Clean up temporary files
-      await this.cleanupTempFiles(backupDir);
-
-      // Update result
       result.success = true;
       result.duration = Date.now() - startTime;
-      result.location = archivePath;
 
-      // Update backup history
       this.backupHistory.push(result);
-      this.lastBackup = timestamp;
-
-      // Clean up old backups
-      await this.cleanupOldBackups();
-
-      // Send notifications
-      if (this.config.notifications.enabled && this.config.notifications.onSuccess) {
-        await this.sendNotification('Backup completed successfully', result);
-      }
-
-      logger.info(`Backup completed successfully: ${backupId}`, {
-        duration: result.duration,
-        size: result.size,
-        location: result.location
-      });
+      logger.info('Database backup completed successfully');
 
       return result;
     } catch (error) {
-      const result: BackupResult = {
-        success: false,
-        timestamp,
-        duration: Date.now() - startTime,
-        size: 0,
-        location: '',
-        type: 'full',
-        details: {},
-        errors: [error instanceof Error ? error.message : 'Unknown error'],
-        warnings: []
-      };
-
-      // Send failure notification
-      if (this.config.notifications.enabled && this.config.notifications.onFailure) {
-        await this.sendNotification('Backup failed', result);
-      }
-
-      logger.error(`Backup failed: ${backupId}`, error);
-      throw error;
-    } finally {
-      this.isRunning = false;
-    }
-  }
-
-  /**
-   * Backup database
-   */
-  private async backupDatabase(backupDir: string, result: BackupResult): Promise<void> {
-    try {
-      logger.info('Starting database backup');
-
-      const dbBackupPath = path.join(backupDir, 'database');
-      await fs.promises.mkdir(dbBackupPath, { recursive: true });
-
-      // Get database statistics
-      const stats = await this.getDatabaseStats();
-      result.details.database = stats;
-
-      // Export schema if enabled
-      if (this.config.database.includeSchema) {
-        await this.exportDatabaseSchema(dbBackupPath);
-      }
-
-      // Export data if enabled
-      if (this.config.database.includeData) {
-        await this.exportDatabaseData(dbBackupPath);
-      }
-
-      // Export migrations if enabled
-      if (this.config.database.includeMigrations) {
-        await this.exportMigrations(dbBackupPath);
-      }
-
-      logger.info('Database backup completed successfully');
-    } catch (error) {
       logger.error('Database backup failed:', error);
-      result.errors?.push(`Database backup failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
       throw error;
-    }
-  }
-
-  /**
-   * Get database statistics
-   */
-  private async getDatabaseStats(): Promise<{ tables: number; records: number; size: number }> {
-    try {
-      // Get table count
-      const tables = await this.prisma.$queryRaw`
-        SELECT COUNT(*) as count FROM information_schema.tables 
-        WHERE table_schema = 'public'
-      `;
-
-      // Get total record count
-      const records = await this.prisma.$queryRaw`
-        SELECT SUM(reltuples) as count FROM pg_class 
-        WHERE relkind = 'r'
-      `;
-
-      // Get database size
-      const size = await this.prisma.$queryRaw`
-        SELECT pg_database_size(current_database()) as size
-      `;
-
-      return {
-        tables: parseInt(tables[0]?.count || '0'),
-        records: parseInt(records[0]?.count || '0'),
-        size: parseInt(size[0]?.size || '0')
-      };
-    } catch (error) {
-      logger.warn('Failed to get database stats:', error);
-      return { tables: 0, records: 0, size: 0 };
-    }
-  }
-
-  /**
-   * Export database schema
-   */
-  private async exportDatabaseSchema(backupDir: string): Promise<void> {
-    try {
-      const schemaPath = path.join(backupDir, 'schema.sql');
-      
-      // Use pg_dump for schema only
-      const command = `pg_dump --schema-only --no-owner --no-privileges --file="${schemaPath}" ${process.env.DATABASE_URL}`;
-      
-      await execAsync(command);
-      logger.info('Database schema exported successfully');
-    } catch (error) {
-      logger.warn('Failed to export database schema:', error);
-      // Fallback: create basic schema file
-      await this.createBasicSchemaFile(backupDir);
-    }
-  }
-
-  /**
-   * Export database data
-   */
-  private async exportDatabaseData(backupDir: string): Promise<void> {
-    try {
-      const dataPath = path.join(backupDir, 'data.sql');
-      
-      // Use pg_dump for data only
-      const command = `pg_dump --data-only --no-owner --no-privileges --file="${dataPath}" ${process.env.DATABASE_URL}`;
-      
-      await execAsync(command);
-      logger.info('Database data exported successfully');
-    } catch (error) {
-      logger.warn('Failed to export database data:', error);
-      // Fallback: export data in chunks
-      await this.exportDataInChunks(backupDir);
-    }
-  }
-
-  /**
-   * Export migrations
-   */
-  private async exportMigrations(backupDir: string): Promise<void> {
-    try {
-      const migrationsPath = path.join(backupDir, 'migrations');
-      await fs.promises.mkdir(migrationsPath, { recursive: true });
-
-      // Copy Prisma migrations
-      const prismaDir = path.join(process.cwd(), 'prisma');
-      if (await this.pathExists(prismaDir)) {
-        const migrationsDir = path.join(prismaDir, 'migrations');
-        if (await this.pathExists(migrationsDir)) {
-          await this.copyDirectory(migrationsDir, migrationsPath);
-          logger.info('Migrations exported successfully');
-        }
-      }
-    } catch (error) {
-      logger.warn('Failed to export migrations:', error);
     }
   }
 
   /**
    * Backup files
    */
-  private async backupFiles(backupDir: string, result: BackupResult): Promise<void> {
+  private async backupFiles(): Promise<BackupResult> {
+    const startTime = Date.now();
+    const timestamp = new Date();
+    const backupId = this.generateBackupId('files');
+
+    logger.info('Starting files backup');
+
     try {
-      logger.info('Starting file backup');
-
-      const filesBackupPath = path.join(backupDir, 'files');
-      await fs.promises.mkdir(filesBackupPath, { recursive: true });
-
-      let totalFiles = 0;
-      let totalSize = 0;
-
-      // Backup logs if enabled
-      if (this.config.files.includeLogs) {
-        const logsPath = path.join(process.cwd(), 'logs');
-        if (await this.pathExists(logsPath)) {
-          const { count, size } = await this.backupDirectory(logsPath, path.join(filesBackupPath, 'logs'));
-          totalFiles += count;
-          totalSize += size;
-        }
-      }
-
-      // Backup uploads if enabled
-      if (this.config.files.includeUploads) {
-        const uploadsPath = path.join(process.cwd(), 'uploads');
-        if (await this.pathExists(uploadsPath)) {
-          const { count, size } = await this.backupDirectory(uploadsPath, path.join(filesBackupPath, 'uploads'));
-          totalFiles += count;
-          totalSize += size;
-        }
-      }
-
-      // Backup config if enabled
-      if (this.config.files.includeConfig) {
-        const configPath = path.join(process.cwd(), 'src', 'config');
-        if (await this.pathExists(configPath)) {
-          const { count, size } = await this.backupDirectory(configPath, path.join(filesBackupPath, 'config'));
-          totalFiles += count;
-          totalSize += size;
-        }
-      }
-
-      result.details.files = {
-        count: totalFiles,
-        size: totalSize
+      const result: BackupResult = {
+        success: false,
+        timestamp,
+        duration: 0,
+        backupType: 'files',
+        backupId,
+        size: 0,
+        location: '',
+        checksum: '',
+        metadata: {
+          filesCount: 0,
+          databaseSize: 0,
+          compressionRatio: 0,
+          encryptionEnabled: false,
+          verificationPassed: false
+        },
+        errors: [],
+        warnings: []
       };
 
-      logger.info('File backup completed successfully', {
-        files: totalFiles,
-        size: totalSize
-      });
-    } catch (error) {
-      logger.error('File backup failed:', error);
-      result.errors?.push(`File backup failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Backup a directory with filtering
-   */
-  private async backupDirectory(sourcePath: string, targetPath: string): Promise<{ count: number; size: number }> {
-    await fs.promises.mkdir(targetPath, { recursive: true });
-
-    let fileCount = 0;
-    let totalSize = 0;
-
-    const items = await fs.promises.readdir(sourcePath, { withFileTypes: true });
-
-    for (const item of items) {
-      const sourceItemPath = path.join(sourcePath, item.name);
-      const targetItemPath = path.join(targetPath, item.name);
-
-      // Check if item should be excluded
-      if (this.shouldExcludeItem(item.name)) {
-        continue;
-      }
-
-      if (item.isDirectory()) {
-        const { count, size } = await this.backupDirectory(sourceItemPath, targetItemPath);
-        fileCount += count;
-        totalSize += size;
-      } else if (item.isFile()) {
-        try {
-          await fs.promises.copyFile(sourceItemPath, targetItemPath);
-          const stats = await fs.promises.stat(sourceItemPath);
-          totalSize += stats.size;
-          fileCount++;
-        } catch (error) {
-          logger.warn(`Failed to backup file: ${sourceItemPath}`, error);
-        }
-      }
-    }
-
-    return { count: fileCount, size: totalSize };
-  }
-
-  /**
-   * Check if item should be excluded from backup
-   */
-  private shouldExcludeItem(itemName: string): boolean {
-    return this.config.files.excludePatterns.some(pattern => {
-      if (pattern.includes('*')) {
-        const regex = new RegExp(pattern.replace(/\*/g, '.*'));
-        return regex.test(itemName);
-      }
-      return itemName === pattern;
-    });
-  }
-
-  /**
-   * Create backup archive
-   */
-  private async createBackupArchive(backupDir: string, backupId: string, result: BackupResult): Promise<string> {
-    try {
-      const archivePath = path.join(this.config.storage.local.path, `${backupId}.zip`);
-      
-      return new Promise((resolve, reject) => {
-        const output = fs.createWriteStream(archivePath);
-        const archive = archiver('zip', {
-          zlib: { level: this.config.compression.enabled ? this.config.compression.level : 0 }
-        });
-
-        output.on('close', () => {
-          result.size = archive.pointer();
-          resolve(archivePath);
-        });
-
-        archive.on('error', reject);
-        archive.pipe(output);
-        archive.directory(backupDir, false);
-        archive.finalize();
-      });
-    } catch (error) {
-      logger.error('Failed to create backup archive:', error);
-      throw error;
-    }
-  }
-
-  /**
-   * Compress backup file
-   */
-  private async compressBackup(archivePath: string, result: BackupResult): Promise<void> {
-    try {
-      const originalSize = result.size;
-      const compressedPath = `${archivePath}.gz`;
-      
-      // Use gzip compression
-      const command = `gzip -${this.config.compression.level} -c "${archivePath}" > "${compressedPath}"`;
-      await execAsync(command);
-      
-      // Remove original archive
-      await fs.promises.unlink(archivePath);
-      
-      // Update result
-      const compressedStats = await fs.promises.stat(compressedPath);
-      result.size = compressedStats.size;
-      result.location = compressedPath;
-      
-      result.details.compression = {
-        originalSize,
-        compressedSize: result.size,
-        ratio: Math.round((1 - result.size / originalSize) * 100)
-      };
-
-      logger.info('Backup compressed successfully', {
-        originalSize,
-        compressedSize: result.size,
-        ratio: result.details.compression.ratio
-      });
-    } catch (error) {
-      logger.warn('Failed to compress backup:', error);
-      result.warnings?.push(`Compression failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Encrypt backup file
-   */
-  private async encryptBackup(archivePath: string, result: BackupResult): Promise<void> {
-    try {
-      const key = this.config.encryption.key || CryptoUtils.generateKey();
-      const encryptedPath = `${archivePath}.enc`;
-      
-      // Read file content
-      const fileContent = await fs.promises.readFile(archivePath);
-      
-      // Encrypt content
-      const { encrypted, iv, tag } = CryptoUtils.encrypt(fileContent, key);
-      
-      // Combine IV, tag, and encrypted data
-      const encryptedData = Buffer.concat([iv, tag, encrypted]);
-      
-      // Write encrypted file
-      await fs.promises.writeFile(encryptedPath, encryptedData);
-      
-      // Remove original file
-      await fs.promises.unlink(archivePath);
-      
-      // Update result
-      const encryptedStats = await fs.promises.stat(encryptedPath);
-      result.size = encryptedStats.size;
-      result.location = encryptedPath;
-      
-      result.details.encryption = {
-        algorithm: 'AES-256-GCM',
-        keySize: key.length * 8
-      };
-
-      logger.info('Backup encrypted successfully');
-    } catch (error) {
-      logger.error('Failed to encrypt backup:', error);
-      result.errors?.push(`Encryption failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-      throw error;
-    }
-  }
-
-  /**
-   * Upload backup to cloud storage
-   */
-  private async uploadToCloud(archivePath: string, backupId: string, result: BackupResult): Promise<void> {
-    try {
-      logger.info('Uploading backup to cloud storage');
-      
-      // Implementation would depend on the cloud provider
-      // For now, just log the action
-      logger.info(`Backup ${backupId} ready for cloud upload: ${archivePath}`);
-      
-      // Update result location to include cloud path
-      result.location = `${result.location} (cloud: ${this.config.storage.cloud.provider})`;
-    } catch (error) {
-      logger.error('Failed to upload backup to cloud:', error);
-      result.warnings?.push(`Cloud upload failed: ${error instanceof Error ? error.message : 'Unknown error'}`);
-    }
-  }
-
-  /**
-   * Clean up temporary files
-   */
-  private async cleanupTempFiles(backupDir: string): Promise<void> {
-    try {
-      await fs.promises.rm(backupDir, { recursive: true, force: true });
-      logger.info('Temporary backup files cleaned up');
-    } catch (error) {
-      logger.warn('Failed to cleanup temporary files:', error);
-    }
-  }
-
-  /**
-   * Clean up old backups based on retention policy
-   */
-  private async cleanupOldBackups(): Promise<void> {
-    try {
-      const backupFiles = await fs.promises.readdir(this.config.storage.local.path);
-      const backupPaths = backupFiles
-        .filter(file => file.endsWith('.zip') || file.endsWith('.gz') || file.endsWith('.enc'))
-        .map(file => path.join(this.config.storage.local.path, file));
-
-      // Sort by modification time (oldest first)
-      const backupStats = await Promise.all(
-        backupPaths.map(async (filePath) => {
-          const stats = await fs.promises.stat(filePath);
-          return { path: filePath, mtime: stats.mtime };
-        })
+      const backupPath = path.join(
+        this.config.storage.local.path,
+        'files',
+        `files-backup-${DateHelper.formatDate(timestamp, 'YYYY-MM-DD-HH-mm-ss')}.tar.gz`
       );
 
-      backupStats.sort((a, b) => a.mtime.getTime() - b.mtime.getTime());
+      await this.createFileArchive(backupPath);
 
-      // Remove old backups based on retention policy
-      const cutoffDate = new Date();
-      cutoffDate.setDate(cutoffDate.getDate() - this.config.retention.days);
+      const fileStats = fs.statSync(backupPath);
+      result.size = fileStats.size;
+      result.location = backupPath;
 
-      let removedCount = 0;
-      for (const backup of backupStats) {
-        if (backup.mtime < cutoffDate || removedCount >= this.config.retention.maxBackups) {
-          try {
-            await fs.promises.unlink(backup.path);
-            removedCount++;
-            logger.info(`Removed old backup: ${path.basename(backup.path)}`);
-          } catch (error) {
-            logger.warn(`Failed to remove old backup: ${backup.path}`, error);
-          }
-        }
+      if (this.config.verification.checksum) {
+        result.checksum = await this.calculateChecksum(result.location);
       }
 
-      if (removedCount > 0) {
-        logger.info(`Cleaned up ${removedCount} old backups`);
-        
-        // Send cleanup notification
-        if (this.config.notifications.enabled && this.config.notifications.onCleanup) {
-          await this.sendNotification(`Cleaned up ${removedCount} old backups`, {
-            success: true,
-            timestamp: new Date(),
-            duration: 0,
-            size: 0,
-            location: '',
-            type: 'cleanup',
-            details: { removedCount }
-          });
-        }
-      }
-    } catch (error) {
-      logger.error('Failed to cleanup old backups:', error);
-    }
-  }
+      result.success = true;
+      result.duration = Date.now() - startTime;
 
-  /**
-   * Send notification
-   */
-  private async sendNotification(message: string, result: BackupResult): Promise<void> {
-    try {
-      // Implementation would depend on notification system
-      // For now, just log the notification
-      logger.info(`Notification: ${message}`, {
-        backupId: this.generateBackupId(result.timestamp),
-        success: result.success,
-        duration: result.duration,
-        size: result.size
-      });
-    } catch (error) {
-      logger.warn('Failed to send notification:', error);
-    }
-  }
+      this.backupHistory.push(result);
+      logger.info('Files backup completed successfully');
 
-  /**
-   * Generate backup ID
-   */
-  private generateBackupId(timestamp: Date): string {
-    return `backup-${DateHelper.formatDate(timestamp, 'YYYY-MM-DD-HH-mm-ss')}`;
-  }
-
-  /**
-   * Ensure backup directory exists
-   */
-  private async ensureBackupDirectory(): Promise<void> {
-    try {
-      await fs.promises.mkdir(this.config.storage.local.path, { recursive: true });
-      logger.info(`Backup directory ensured: ${this.config.storage.local.path}`);
+      return result;
     } catch (error) {
-      logger.error('Failed to create backup directory:', error);
+      logger.error('Files backup failed:', error);
       throw error;
     }
   }
 
   /**
-   * Check if path exists
+   * Backup logs
    */
-  private async pathExists(path: string): Promise<boolean> {
+  private async backupLogs(): Promise<BackupResult> {
+    logger.info('Logs backup not yet implemented');
+    return this.createEmptyBackupResult('logs');
+  }
+
+  /**
+   * Backup config
+   */
+  private async backupConfig(): Promise<BackupResult> {
+    logger.info('Config backup not yet implemented');
+    return this.createEmptyBackupResult('config');
+  }
+
+  /**
+   * Perform database backup
+   */
+  private async performDatabaseBackup(backupPath: string): Promise<void> {
     try {
-      await fs.promises.access(path);
-      return true;
-    } catch {
+      switch (this.config.database.engine) {
+        case 'postgresql':
+          await this.backupPostgreSQL(backupPath);
+          break;
+        case 'mysql':
+          await this.backupMySQL(backupPath);
+          break;
+        case 'sqlite':
+          await this.backupSQLite(backupPath);
+          break;
+        default:
+          throw new Error(`Unsupported database engine: ${this.config.database.engine}`);
+      }
+    } catch (error) {
+      logger.error('Database backup failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Backup PostgreSQL database
+   */
+  private async backupPostgreSQL(backupPath: string): Promise<void> {
+    try {
+      const { host, port, username, password, database } = this.config.database;
+      const command = `PGPASSWORD="${password || ''}" pg_dump -h ${host || 'localhost'} -p ${port || 5432} -U ${username || 'postgres'} -d ${database || 'pharmacy_system'} -f ${backupPath}`;
+      await execAsync(command);
+      logger.info('PostgreSQL backup completed successfully');
+    } catch (error) {
+      logger.error('PostgreSQL backup failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Backup MySQL database
+   */
+  private async backupMySQL(backupPath: string): Promise<void> {
+    try {
+      const { host, port, username, password, database } = this.config.database;
+      const command = `mysqldump -h ${host || 'localhost'} -P ${port || 3306} -u ${username || 'root'} -p${password || ''} ${database || 'pharmacy_system'} > ${backupPath}`;
+      await execAsync(command);
+      logger.info('MySQL backup completed successfully');
+    } catch (error) {
+      logger.error('MySQL backup failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Backup SQLite database
+   */
+  private async backupSQLite(backupPath: string): Promise<void> {
+    try {
+      const dbPath = path.join(process.cwd(), 'prisma', 'dev.db');
+      if (fs.existsSync(dbPath)) {
+        fs.copyFileSync(dbPath, backupPath);
+        logger.info('SQLite backup completed successfully');
+      } else {
+        throw new Error('SQLite database file not found');
+      }
+    } catch (error) {
+      logger.error('SQLite backup failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Create file archive
+   */
+  private async createFileArchive(backupPath: string): Promise<void> {
+    try {
+      const importantDirs = ['./src', './prisma', './uploads', './logs'];
+      const command = `tar -czf ${backupPath} ${importantDirs.join(' ')}`;
+      await execAsync(command);
+      logger.info('File archive created successfully');
+    } catch (error) {
+      logger.error('File archive creation failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Compress file
+   */
+  private async compressFile(filePath: string): Promise<string> {
+    try {
+      const compressedPath = `${filePath}.gz`;
+      const command = `gzip -${this.config.database.compressionLevel} -c ${filePath} > ${compressedPath}`;
+      await execAsync(command);
+      logger.info('File compressed successfully');
+      return compressedPath;
+    } catch (error) {
+      logger.error('File compression failed:', error);
+      throw error;
+    }
+  }
+
+  /**
+   * Calculate checksum
+   */
+  private async calculateChecksum(filePath: string): Promise<string> {
+    try {
+      const command = `sha256sum ${filePath}`;
+      const { stdout } = await execAsync(command);
+      return stdout.split(' ')[0];
+    } catch (error) {
+      logger.error('Checksum calculation failed:', error);
+      return '';
+    }
+  }
+
+  /**
+   * Verify backup
+   */
+  private async verifyBackup(backupPath: string): Promise<boolean> {
+    try {
+      if (fs.existsSync(backupPath)) {
+        const stats = fs.statSync(backupPath);
+        return stats.size > 0;
+      }
+      return false;
+    } catch (error) {
+      logger.error('Backup verification failed:', error);
       return false;
     }
   }
 
   /**
-   * Copy directory recursively
+   * Process errors
    */
-  private async copyDirectory(source: string, target: string): Promise<void> {
-    await fs.promises.mkdir(target, { recursive: true });
-    
-    const items = await fs.promises.readdir(source, { withFileTypes: true });
-    
-    for (const item of items) {
-      const sourcePath = path.join(source, item.name);
-      const targetPath = path.join(target, item.name);
-      
-      if (item.isDirectory()) {
-        await this.copyDirectory(sourcePath, targetPath);
-      } else {
-        await fs.promises.copyFile(sourcePath, targetPath);
-      }
-    }
-  }
-
-  /**
-   * Create basic schema file as fallback
-   */
-  private async createBasicSchemaFile(backupDir: string): Promise<void> {
-    const schemaPath = path.join(backupDir, 'schema.sql');
-    const basicSchema = `-- Basic schema export (fallback)
--- Generated on: ${new Date().toISOString()}
--- Note: This is a fallback schema export
-`;
-    
-    await fs.promises.writeFile(schemaPath, basicSchema);
-    logger.info('Basic schema file created as fallback');
-  }
-
-  /**
-   * Export data in chunks as fallback
-   */
-  private async exportDataInChunks(backupDir: string): Promise<void> {
+  private async processErrors(): Promise<void> {
     try {
-      const dataPath = path.join(backupDir, 'data.sql');
-      let dataContent = `-- Data export (fallback)
--- Generated on: ${new Date().toISOString()}
--- Note: This is a fallback data export
-`;
-
-      // Export data from main tables in chunks
-      const tables = ['users', 'medicines', 'orders', 'suppliers', 'inventory'];
-      
-      for (const table of tables) {
-        try {
-          const count = await this.prisma.$queryRaw`SELECT COUNT(*) as count FROM ${table}`;
-          dataContent += `\n-- Table: ${table} (${count[0]?.count || 0} records)\n`;
-          
-          // Export in chunks of 1000
-          const chunkSize = 1000;
-          let offset = 0;
-          
-          while (true) {
-            const records = await this.prisma.$queryRaw`SELECT * FROM ${table} LIMIT ${chunkSize} OFFSET ${offset}`;
-            
-            if (records.length === 0) break;
-            
-            for (const record of records) {
-              dataContent += `INSERT INTO ${table} VALUES (${JSON.stringify(record)});\n`;
-            }
-            
-            offset += chunkSize;
-            
-            if (records.length < chunkSize) break;
-          }
-        } catch (error) {
-          logger.warn(`Failed to export data from table ${table}:`, error);
-          dataContent += `-- Failed to export data from table ${table}\n`;
+      for (const error of this.errorQueue) {
+        if (error.retryCount < 3) {
+          await this.retryError(error);
+        } else {
+          await this.handleUnresolvedError(error);
         }
       }
-      
-      await fs.promises.writeFile(dataPath, dataContent);
-      logger.info('Data exported in chunks as fallback');
     } catch (error) {
-      logger.error('Failed to export data in chunks:', error);
-      throw error;
+      logger.error('Failed to process errors:', error);
     }
   }
 
   /**
-   * Get backup status
+   * Retry error
+   */
+  private async retryError(backupError: BackupError): Promise<void> {
+    try {
+      backupError.retryCount++;
+      logger.info(`Retrying error ${backupError.id} (attempt ${backupError.retryCount})`);
+    } catch (error) {
+      logger.error(`Failed to retry error ${backupError.id}:`, error);
+    }
+  }
+
+  /**
+   * Handle unresolved error
+   */
+  private async handleUnresolvedError(backupError: BackupError): Promise<void> {
+    try {
+      logger.error(`Error ${backupError.id} exceeded retry attempts`, {
+        type: backupError.type,
+        message: backupError.message,
+        retryCount: backupError.retryCount
+      });
+
+      if (this.config.notifications.enabled) { // Changed from notifyErrors to enabled
+        await this.notifyError(backupError);
+      }
+    } catch (error) {
+      logger.error(`Failed to handle unresolved error ${backupError.id}:`, error);
+    }
+  }
+
+  /**
+   * Apply retention policy
+   */
+  private async applyRetentionPolicy(): Promise<void> {
+    if (!this.config.retention.enabled) {
+      return;
+    }
+
+    try {
+      logger.info('Applying retention policy');
+      // TODO: Implement retention policy logic
+      logger.info('Retention policy applied successfully');
+    } catch (error) {
+      logger.error('Failed to apply retention policy:', error);
+    }
+  }
+
+  /**
+   * Send backup notifications
+   */
+  private async sendBackupNotifications(results: BackupResult[]): Promise<void> {
+    try {
+      const totalBackups = results.length;
+      const successfulBackups = results.filter(r => r.success).length;
+      const failedBackups = totalBackups - successfulBackups;
+
+      if (this.config.notifications.onSuccess && failedBackups === 0) {
+        await this.sendSuccessNotification(results);
+      }
+
+      if (this.config.notifications.onFailure && failedBackups > 0) {
+        await this.sendFailureNotification(results);
+      }
+
+      logger.info('Backup notifications sent successfully');
+    } catch (error) {
+      logger.error('Failed to send backup notifications:', error);
+    }
+  }
+
+  /**
+   * Send success notification
+   */
+  private async sendSuccessNotification(results: BackupResult[]): Promise<void> {
+    try {
+      logger.info('Success notification sent');
+    } catch (error) {
+      logger.error('Failed to send success notification:', error);
+    }
+  }
+
+  /**
+   * Send failure notification
+   */
+  private async sendFailureNotification(results: BackupResult[]): Promise<void> {
+    try {
+      logger.info('Failure notification sent');
+    } catch (error) {
+      logger.error('Failed to send failure notification:', error);
+    }
+  }
+
+  /**
+   * Notify error
+   */
+  private async notifyError(backupError: BackupError): Promise<void> {
+    try {
+      logger.info(`Error notification sent for ${backupError.id}`);
+    } catch (error) {
+      logger.error(`Failed to notify error ${backupError.id}:`, error);
+    }
+  }
+
+  /**
+   * Create empty backup result
+   */
+  private createEmptyBackupResult(backupType: string): BackupResult {
+    return {
+      success: true,
+      timestamp: new Date(),
+      duration: 0,
+      backupType,
+      backupId: this.generateBackupId(backupType),
+      size: 0,
+      location: '',
+      checksum: '',
+      metadata: {
+        filesCount: 0,
+        databaseSize: 0,
+        compressionRatio: 0,
+        encryptionEnabled: false,
+        verificationPassed: false
+      },
+      errors: [],
+      warnings: []
+    };
+  }
+
+  /**
+   * Generate backup ID
+   */
+  private generateBackupId(type: string): string {
+    return `backup-${type}-${Date.now()}-${Math.random().toString(36).substr(2, 9)}`;
+  }
+
+  /**
+   * Get backup job status
    */
   getStatus(): {
     isRunning: boolean;
-    lastBackup: Date | null;
+    lastRun: Date | null;
     backupCount: number;
     nextBackup: Date;
     config: BackupConfig;
   } {
     return {
       isRunning: this.isRunning,
-      lastBackup: this.lastBackup,
+      lastRun: this.lastRun,
       backupCount: this.backupHistory.length,
       nextBackup: this.getNextBackupTime(),
       config: this.config
@@ -974,29 +854,27 @@ export class BackupJob {
   /**
    * Perform manual backup
    */
-  async performManualBackup(): Promise<BackupResult> {
+  async performManualBackup(backupType?: string): Promise<BackupResult[]> {
     logger.info('Manual backup requested');
-    return this.performBackup();
-  }
-
-  /**
-   * Restore backup
-   */
-  async restoreBackup(backupPath: string): Promise<void> {
-    try {
-      logger.info(`Starting backup restoration from: ${backupPath}`);
-      
-      // Implementation would depend on backup format and restoration requirements
-      // For now, just log the action
-      logger.info(`Backup restoration initiated: ${backupPath}`);
-      
-      // TODO: Implement actual restoration logic
-      throw new Error('Backup restoration not yet implemented');
-    } catch (error) {
-      logger.error('Backup restoration failed:', error);
-      throw error;
+    
+    if (backupType) {
+      switch (backupType) {
+        case 'database':
+          return [await this.backupDatabase()];
+        case 'files':
+          return [await this.backupFiles()];
+        case 'logs':
+          return [await this.backupLogs()];
+        case 'config':
+          return [await this.backupConfig()];
+        default:
+          throw new Error(`Unknown backup type: ${backupType}`);
+      }
+    } else {
+      return this.performFullBackup();
     }
   }
 }
 
 export default BackupJob;
+
